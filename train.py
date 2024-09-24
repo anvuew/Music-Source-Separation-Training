@@ -6,7 +6,7 @@ import random
 import argparse
 import time
 import copy
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import sys
 import os
 import glob
@@ -58,9 +58,6 @@ def load_not_compatible_weights(model, weights, verbose=False):
     if 'state' in old_model:
         # Fix for htdemucs weights loading
         old_model = old_model['state']
-    if 'state_dict' in old_model:
-        # Fix for apollo weights loading
-        old_model = old_model['state_dict']
 
     for el in new_model:
         if el in old_model:
@@ -327,7 +324,7 @@ def train_model(args):
     parser.add_argument("--use_mse_loss", action='store_true', help="Use default MSE loss")
     parser.add_argument("--use_l1_loss", action='store_true', help="Use L1 loss")
     parser.add_argument("--wandb_key", type=str, default='', help='wandb API Key')
-    parser.add_argument("--pre_valid", action='store_true', help='Run validation before training')
+    parser.add_argument("--resume", action='store_true', help="Full resume mode")
     if args is None:
         args = parser.parse_args()
     else:
@@ -341,7 +338,8 @@ def train_model(args):
     model, config = get_model_from_config(args.model_type, args.config_path)
     print("Instruments: {}".format(config.training.instruments))
 
-    os.makedirs(args.results_path, exist_ok=True)
+    if not os.path.isdir(args.results_path):
+        os.mkdir(args.results_path)
 
     use_amp = True
     try:
@@ -358,49 +356,7 @@ def train_model(args):
     else:
         wandb.login(key = args.wandb_key)
         wandb.init(project = 'msst', config = { 'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size })
-
-    trainset = MSSDataset(
-        config,
-        args.data_path,
-        batch_size=batch_size,
-        metadata_path=os.path.join(args.results_path, 'metadata_{}.pkl'.format(args.dataset_type)),
-        dataset_type=args.dataset_type,
-    )
-
-    train_loader = DataLoader(
-        trainset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory
-    )
-
-    if args.start_check_point != '':
-        print('Start from checkpoint: {}'.format(args.start_check_point))
-        if 1:
-            load_not_compatible_weights(model, args.start_check_point, verbose=False)
-        else:
-            model.load_state_dict(
-                torch.load(args.start_check_point)
-            )
-
-    if torch.cuda.is_available():
-        if len(device_ids) <= 1:
-            print('Use single GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = model.to(device)
-        else:
-            print('Use multi GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = nn.DataParallel(model, device_ids=device_ids).to(device)
-    else:
-        device = 'cpu'
-        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
-        model = model.to(device)
-
-    if args.pre_valid:
-        valid_multi_gpu(model, args, config, verbose=True)
-
+        
     optim_params = dict()
     if 'optimizer' in config:
         optim_params = dict(config['optimizer'])
@@ -428,6 +384,70 @@ def train_model(args):
     else:
         print('Unknown optimizer: {}'.format(config.training.optimizer))
         exit()
+    
+    trainset = MSSDataset(
+        config,
+        args.data_path,
+        batch_size=batch_size,
+        metadata_path=os.path.join(args.results_path, 'metadata_{}.pkl'.format(args.dataset_type)),
+        dataset_type=args.dataset_type,
+    )
+
+    train_loader = DataLoader(
+        trainset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory
+    )
+
+    if args.start_check_point != '':
+        print('Start from checkpoint: {}'.format(args.start_check_point))
+        if 'last' in args.start_check_point:
+            checkpoint = torch.load(args.start_check_point)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            print("Not compatible checkpoint, trying to convert it...")
+            #checkpoint = torch.load(args.start_check_point)
+            # THAT FUNCTION SHOULD BE REWORK TO BE COMPATIBLE WITH FULL RESUME
+            load_not_compatible_weights(model, args.start_check_point, verbose=False)
+            resume_epoch = 0
+
+    if torch.cuda.is_available():
+        if len(device_ids) <= 1:
+            print('Use single GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = model.to(device)
+        else:
+            print('Use multi GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = nn.DataParallel(model, device_ids=device_ids).to(device)
+    else:
+        device = 'cpu'
+        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
+        model = model.to(device)
+
+    if args.resume:
+        print("Loading optimizer state...")
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        resume_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training for epoch {resume_epoch}")
+
+        best_sdr = checkpoint['sdr']
+        print(f"Saved SDR = {best_sdr:.6f}")
+
+        saved_loss = checkpoint['loss'] # unused, just a reminder
+        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
+    else:
+        resume_epoch = 0
+        print(f"Starting training from epoch {resume_epoch}")
+        best_sdr = -100
+
+
+    if 0:
+        valid(model, args, config, device, verbose=True)
+
 
     gradient_accumulation_steps = 1
     try:
@@ -446,6 +466,24 @@ def train_model(args):
     # Reduce LR if no SDR improvements for several epochs
     scheduler = ReduceLROnPlateau(optimizer, 'max', patience=config.training.patience, factor=config.training.reduce_factor)
 
+    if args.resume:
+        print("Loading scheduler state...")
+
+        # force custom scheduler value
+        # checkpoint['scheduler']['patience'] = 6
+        # checkpoint['scheduler']['factor'] = 0.95
+
+        # load scheduler state
+        scheduler.load_state_dict(checkpoint['scheduler'])
+
+
+        # force custom lr values during training
+        # optimizer.param_groups[0]['lr'] = 8.0e-5
+
+
+    # epsilon value
+    EPS = 1e-08
+
     if args.use_multistft_loss:
         try:
             loss_options = dict(config.loss_multistft)
@@ -458,8 +496,8 @@ def train_model(args):
 
     scaler = GradScaler()
     print('Train for: {}'.format(config.training.num_epochs))
-    best_sdr = -100
     for epoch in range(config.training.num_epochs):
+        epoch += resume_epoch
         model.train().to(device)
         print('Train epoch: {} Learning rate: {}'.format(epoch, optimizer.param_groups[0]['lr']))
         loss_val = 0.
@@ -481,13 +519,8 @@ def train_model(args):
                 else:
                     y_ = model(x)
                     if args.use_multistft_loss:
-                        if len(y_.shape) == 3:
-                            # For models like apollo no need to reshape
-                            y1_ = y_
-                            y1 = y
-                        else:
-                            y1_ = torch.reshape(y_, (y_.shape[0], y_.shape[1] * y_.shape[2], y_.shape[3]))
-                            y1 = torch.reshape(y, (y.shape[0], y.shape[1] * y.shape[2], y.shape[3]))
+                        y1_ = torch.reshape(y_, (y_.shape[0], y_.shape[1] * y_.shape[2], y_.shape[3]))
+                        y1 = torch.reshape(y, (y.shape[0], y.shape[1] * y.shape[2], y.shape[3]))
                         loss = loss_multistft(y1_, y1)
                         # We can use many losses at the same time
                         if args.use_mse_loss:
@@ -519,23 +552,18 @@ def train_model(args):
             li = loss.item() * gradient_accumulation_steps
             loss_val += li
             total += 1
-            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
+            avg_loss = 100 * loss_val / (i + 1)
+            pbar.set_postfix({'loss': 100 * li, 'avg_loss': avg_loss})
             wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'total': total, 'loss_val': loss_val, 'i': i })
             loss.detach()
+        training_loss = (loss_val / total) * 100
 
-        print('Training loss: {:.6f}'.format(loss_val / total))
+        print('Training loss: {:.6f}'.format(training_loss))
         wandb.log({'train_loss': loss_val / total, 'epoch': epoch})
 
-        # Save last
-        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
-        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
-        torch.save(
-            state_dict,
-            store_path
-        )
 
         # if you have problem with multiproc validation change 0 to 1
-        if 0:
+        if 1:
             sdr_avg = valid(model, args, config, device, verbose=False)
         else:
             sdr_avg = valid_multi_gpu(model, args, config, verbose=False)
@@ -550,6 +578,20 @@ def train_model(args):
             best_sdr = sdr_avg
         scheduler.step(sdr_avg)
         wandb.log({'sdr_avg': sdr_avg, 'best_sdr': best_sdr})
+        
+        # Save last
+        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
+        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'loss': training_loss,
+            'sdr': best_sdr,
+            },
+            store_path
+        )
 
 
 if __name__ == "__main__":
